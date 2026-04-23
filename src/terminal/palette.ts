@@ -1,4 +1,4 @@
-// Activi palette tokens for CLI/UI theming. Teal/green theme matching the Activi logo.
+// Lobster palette tokens for CLI/UI theming. Use this palette for all CLI color output.
 // Keep in sync with docs/cli/index.md (CLI palette section).
 export const LOBSTER_PALETTE = {
   accent: "#5A9BA8",

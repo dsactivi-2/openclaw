@@ -1,11 +1,50 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetFileLockStateForTest } from "../../infra/file-lock.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { resolveApiKeyForProfile } from "./oauth.js";
-import { ensureAuthProfileStore } from "./store.js";
+import { clearRuntimeAuthProfileStoreSnapshots, ensureAuthProfileStore } from "./store.js";
 import type { AuthProfileStore } from "./types.js";
+const { getOAuthApiKeyMock } = vi.hoisted(() => ({
+  getOAuthApiKeyMock: vi.fn(async () => {
+    throw new Error("invalid_grant");
+  }),
+}));
+
+vi.mock("@mariozechner/pi-ai/oauth", () => ({
+  getOAuthApiKey: getOAuthApiKeyMock,
+  getOAuthProviders: () => [{ id: "anthropic" }, { id: "openai-codex" }],
+}));
+
+vi.mock("../cli-credentials.js", () => ({
+  readCodexCliCredentialsCached: () => null,
+  readMiniMaxCliCredentialsCached: () => null,
+  resetCliCredentialCachesForTest: () => undefined,
+}));
+
+vi.mock("../../plugins/provider-runtime.runtime.js", () => ({
+  buildProviderAuthDoctorHintWithPlugin: async () => null,
+  formatProviderAuthProfileApiKeyWithPlugin: async (params: { context?: { access?: string } }) =>
+    params.context?.access,
+  refreshProviderOAuthCredentialWithPlugin: async () => null,
+}));
+
+vi.mock("../../plugins/provider-runtime.js", () => ({
+  resolveExternalAuthProfilesWithPlugins: () => [],
+}));
+
+afterAll(() => {
+  vi.doUnmock("@mariozechner/pi-ai/oauth");
+  vi.doUnmock("../cli-credentials.js");
+  vi.doUnmock("../../plugins/provider-runtime.runtime.js");
+  vi.doUnmock("../../plugins/provider-runtime.js");
+});
+
+function createUsableOAuthExpiry(): number {
+  return Date.now() + 30 * 60 * 1000;
+}
 
 describe("resolveApiKeyForProfile fallback to main agent", () => {
   const envSnapshot = captureEnv([
@@ -18,6 +57,11 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
   let secondaryAgentDir: string;
 
   beforeEach(async () => {
+    resetFileLockStateForTest();
+    getOAuthApiKeyMock.mockReset();
+    getOAuthApiKeyMock.mockImplementation(async () => {
+      throw new Error("invalid_grant");
+    });
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-fallback-test-"));
     mainAgentDir = path.join(tmpDir, "agents", "main", "agent");
     secondaryAgentDir = path.join(tmpDir, "agents", "kids", "agent");
@@ -28,9 +72,46 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
     process.env.OPENCLAW_STATE_DIR = tmpDir;
     process.env.OPENCLAW_AGENT_DIR = mainAgentDir;
     process.env.PI_CODING_AGENT_DIR = mainAgentDir;
+    clearRuntimeAuthProfileStoreSnapshots();
   });
 
+  function createOauthStore(params: {
+    profileId: string;
+    access: string;
+    refresh: string;
+    expires: number;
+    provider?: string;
+  }): AuthProfileStore {
+    return {
+      version: 1,
+      profiles: {
+        [params.profileId]: {
+          type: "oauth",
+          provider: params.provider ?? "anthropic",
+          access: params.access,
+          refresh: params.refresh,
+          expires: params.expires,
+        },
+      },
+    };
+  }
+
+  async function writeAuthProfilesStore(agentDir: string, store: AuthProfileStore) {
+    await fs.writeFile(path.join(agentDir, "auth-profiles.json"), JSON.stringify(store));
+  }
+
+  async function resolveFromSecondaryAgent(profileId: string) {
+    const loadedSecondaryStore = ensureAuthProfileStore(secondaryAgentDir);
+    return resolveApiKeyForProfile({
+      store: loadedSecondaryStore,
+      profileId,
+      agentDir: secondaryAgentDir,
+    });
+  }
+
   afterEach(async () => {
+    resetFileLockStateForTest();
+    clearRuntimeAuthProfileStoreSnapshots();
     vi.unstubAllGlobals();
 
     envSnapshot.restore();
@@ -48,7 +129,7 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
           provider: "anthropic",
           access: "oauth-token",
           refresh: "refresh-token",
-          expires: Date.now() + 60_000,
+          expires: createUsableOAuthExpiry(),
         },
       },
     };
@@ -78,60 +159,31 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
     const freshTime = now + 60 * 60 * 1000; // 1 hour from now
 
     // Write expired credentials for secondary agent
-    const secondaryStore: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [profileId]: {
-          type: "oauth",
-          provider: "anthropic",
-          access: "expired-access-token",
-          refresh: "expired-refresh-token",
-          expires: expiredTime,
-        },
-      },
-    };
-    await fs.writeFile(
-      path.join(secondaryAgentDir, "auth-profiles.json"),
-      JSON.stringify(secondaryStore),
+    await writeAuthProfilesStore(
+      secondaryAgentDir,
+      createOauthStore({
+        profileId,
+        access: "expired-access-token",
+        refresh: "expired-refresh-token",
+        expires: expiredTime,
+      }),
     );
 
     // Write fresh credentials for main agent
-    const mainStore: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [profileId]: {
-          type: "oauth",
-          provider: "anthropic",
-          access: "fresh-access-token",
-          refresh: "fresh-refresh-token",
-          expires: freshTime,
-        },
-      },
-    };
-    await fs.writeFile(path.join(mainAgentDir, "auth-profiles.json"), JSON.stringify(mainStore));
-
-    // Mock fetch to simulate OAuth refresh failure
-    const fetchSpy = vi.fn(async () => {
-      return new Response(JSON.stringify({ error: "invalid_grant" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
-    });
-    vi.stubGlobal("fetch", fetchSpy);
+    await writeAuthProfilesStore(
+      mainAgentDir,
+      createOauthStore({
+        profileId,
+        access: "fresh-access-token",
+        refresh: "fresh-refresh-token",
+        expires: freshTime,
+      }),
+    );
 
     // Load the secondary agent's store (will merge with main agent's store)
-    const loadedSecondaryStore = ensureAuthProfileStore(secondaryAgentDir);
-
-    // Call resolveApiKeyForProfile with the secondary agent's expired credentials
-    // This should:
-    // 1. Try to refresh the expired token (fails due to mocked fetch)
-    // 2. Fall back to main agent's fresh credentials
-    // 3. Copy those credentials to the secondary agent
-    const result = await resolveApiKeyForProfile({
-      store: loadedSecondaryStore,
-      profileId,
-      agentDir: secondaryAgentDir,
-    });
+    // Call resolveApiKeyForProfile with the secondary agent's expired credentials:
+    // refresh fails, then fallback copies main credentials to secondary.
+    const result = await resolveFromSecondaryAgent(profileId);
 
     expect(result).not.toBeNull();
     expect(result?.apiKey).toBe("fresh-access-token");
@@ -153,43 +205,27 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
     const secondaryExpiry = now + 30 * 60 * 1000;
     const mainExpiry = now + 2 * 60 * 60 * 1000;
 
-    const secondaryStore: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [profileId]: {
-          type: "oauth",
-          provider: "anthropic",
-          access: "secondary-access-token",
-          refresh: "secondary-refresh-token",
-          expires: secondaryExpiry,
-        },
-      },
-    };
-    await fs.writeFile(
-      path.join(secondaryAgentDir, "auth-profiles.json"),
-      JSON.stringify(secondaryStore),
+    await writeAuthProfilesStore(
+      secondaryAgentDir,
+      createOauthStore({
+        profileId,
+        access: "secondary-access-token",
+        refresh: "secondary-refresh-token",
+        expires: secondaryExpiry,
+      }),
     );
 
-    const mainStore: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [profileId]: {
-          type: "oauth",
-          provider: "anthropic",
-          access: "main-newer-access-token",
-          refresh: "main-newer-refresh-token",
-          expires: mainExpiry,
-        },
-      },
-    };
-    await fs.writeFile(path.join(mainAgentDir, "auth-profiles.json"), JSON.stringify(mainStore));
+    await writeAuthProfilesStore(
+      mainAgentDir,
+      createOauthStore({
+        profileId,
+        access: "main-newer-access-token",
+        refresh: "main-newer-refresh-token",
+        expires: mainExpiry,
+      }),
+    );
 
-    const loadedSecondaryStore = ensureAuthProfileStore(secondaryAgentDir);
-    const result = await resolveApiKeyForProfile({
-      store: loadedSecondaryStore,
-      profileId,
-      agentDir: secondaryAgentDir,
-    });
+    const result = await resolveFromSecondaryAgent(profileId);
 
     expect(result?.apiKey).toBe("main-newer-access-token");
 
@@ -207,43 +243,27 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
     const now = Date.now();
     const mainExpiry = now + 2 * 60 * 60 * 1000;
 
-    const secondaryStore: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [profileId]: {
-          type: "oauth",
-          provider: "anthropic",
-          access: "secondary-stale",
-          refresh: "secondary-refresh",
-          expires: NaN,
-        },
-      },
-    };
-    await fs.writeFile(
-      path.join(secondaryAgentDir, "auth-profiles.json"),
-      JSON.stringify(secondaryStore),
+    await writeAuthProfilesStore(
+      secondaryAgentDir,
+      createOauthStore({
+        profileId,
+        access: "secondary-stale",
+        refresh: "secondary-refresh",
+        expires: NaN,
+      }),
     );
 
-    const mainStore: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [profileId]: {
-          type: "oauth",
-          provider: "anthropic",
-          access: "main-fresh-token",
-          refresh: "main-refresh",
-          expires: mainExpiry,
-        },
-      },
-    };
-    await fs.writeFile(path.join(mainAgentDir, "auth-profiles.json"), JSON.stringify(mainStore));
+    await writeAuthProfilesStore(
+      mainAgentDir,
+      createOauthStore({
+        profileId,
+        access: "main-fresh-token",
+        refresh: "main-refresh",
+        expires: mainExpiry,
+      }),
+    );
 
-    const loadedSecondaryStore = ensureAuthProfileStore(secondaryAgentDir);
-    const result = await resolveApiKeyForProfile({
-      store: loadedSecondaryStore,
-      profileId,
-      agentDir: secondaryAgentDir,
-    });
+    const result = await resolveFromSecondaryAgent(profileId);
 
     expect(result?.apiKey).toBe("main-fresh-token");
   });
@@ -298,42 +318,58 @@ describe("resolveApiKeyForProfile fallback to main agent", () => {
     const expiredTime = now - 60 * 60 * 1000; // 1 hour ago
 
     // Write expired credentials for both agents
-    const expiredStore: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [profileId]: {
-          type: "oauth",
-          provider: "anthropic",
-          access: "expired-access-token",
-          refresh: "expired-refresh-token",
-          expires: expiredTime,
-        },
-      },
-    };
-    await fs.writeFile(
-      path.join(secondaryAgentDir, "auth-profiles.json"),
-      JSON.stringify(expiredStore),
-    );
-    await fs.writeFile(path.join(mainAgentDir, "auth-profiles.json"), JSON.stringify(expiredStore));
-
-    // Mock fetch to simulate OAuth refresh failure
-    const fetchSpy = vi.fn(async () => {
-      return new Response(JSON.stringify({ error: "invalid_grant" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
+    const expiredStore = createOauthStore({
+      profileId,
+      access: "expired-access-token",
+      refresh: "expired-refresh-token",
+      expires: expiredTime,
     });
-    vi.stubGlobal("fetch", fetchSpy);
-
-    const loadedSecondaryStore = ensureAuthProfileStore(secondaryAgentDir);
+    await writeAuthProfilesStore(secondaryAgentDir, expiredStore);
+    await writeAuthProfilesStore(mainAgentDir, expiredStore);
 
     // Should throw because both agents have expired credentials
-    await expect(
-      resolveApiKeyForProfile({
-        store: loadedSecondaryStore,
+    await expect(resolveFromSecondaryAgent(profileId)).rejects.toThrow(
+      /OAuth token refresh failed/,
+    );
+  });
+
+  it("still falls back to main agent credentials when the refresh-token-reused retry throws", async () => {
+    const profileId = "anthropic:claude-cli";
+    const now = Date.now();
+    const expiredTime = now - 60 * 60 * 1000;
+    const freshTime = now + 60 * 60 * 1000;
+
+    await writeAuthProfilesStore(
+      secondaryAgentDir,
+      createOauthStore({
         profileId,
-        agentDir: secondaryAgentDir,
+        access: "expired-access-token",
+        refresh: "expired-refresh-token",
+        expires: expiredTime,
       }),
-    ).rejects.toThrow(/OAuth token refresh failed/);
+    );
+
+    await writeAuthProfilesStore(
+      mainAgentDir,
+      createOauthStore({
+        profileId,
+        access: "fresh-access-token",
+        refresh: "fresh-refresh-token",
+        expires: freshTime,
+      }),
+    );
+
+    getOAuthApiKeyMock
+      .mockImplementationOnce(async () => {
+        throw new Error("refresh_token_reused");
+      })
+      .mockImplementationOnce(async () => {
+        throw new Error("retry also failed");
+      });
+
+    const result = await resolveFromSecondaryAgent(profileId);
+
+    expect(result?.apiKey).toBe("fresh-access-token");
+    expect(result?.provider).toBe("anthropic");
   });
 });

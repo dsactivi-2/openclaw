@@ -10,7 +10,6 @@ function stripAnsi(text: string): string {
 
 export type OverviewLogTailProps = {
   lines: string[];
-  redacted: boolean;
   onRefreshLogs: () => void;
 };
 
@@ -19,15 +18,13 @@ export function renderOverviewLogTail(props: OverviewLogTailProps) {
     return nothing;
   }
 
-  const displayLines = props.redacted
-    ? "[log hidden]"
-    : props.lines
-        .slice(-50)
-        .map((line) => stripAnsi(line))
-        .join("\n");
+  const displayLines = props.lines
+    .slice(-50)
+    .map((line) => stripAnsi(line))
+    .join("\n");
 
   return html`
-    <details class="card ov-log-tail">
+    <details class="card ov-log-tail" open>
       <summary class="ov-expandable-toggle">
         <span class="nav-item__icon">${icons.scrollText}</span>
         ${t("overview.logTail.title")}
@@ -39,9 +36,10 @@ export function renderOverviewLogTail(props: OverviewLogTailProps) {
             e.stopPropagation();
             props.onRefreshLogs();
           }}
-        >${icons.loader}</span>
+          >${icons.loader}</span
+        >
       </summary>
-      <pre class="ov-log-tail-content ${props.redacted ? "redacted" : ""}">${displayLines}</pre>
+      <pre class="ov-log-tail-content">${displayLines}</pre>
     </details>
   `;
 }

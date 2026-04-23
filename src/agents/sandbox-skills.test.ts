@@ -1,10 +1,10 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { captureFullEnv } from "../test-utils/env.js";
-import { resolveSandboxContext } from "./sandbox.js";
+import { captureEnv } from "../test-utils/env.js";
+import { resolveSandboxContext } from "./sandbox/context.js";
 import { writeSkill } from "./skills.e2e-test-helpers.js";
 
 vi.mock("./sandbox/docker.js", () => ({
@@ -20,23 +20,34 @@ vi.mock("./sandbox/prune.js", () => ({
 }));
 
 describe("sandbox skill mirroring", () => {
-  let envSnapshot: ReturnType<typeof captureFullEnv>;
+  let envSnapshot: ReturnType<typeof captureEnv>;
+  let tempRoot = "";
+
+  beforeAll(async () => {
+    tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-sandbox-skills-"));
+  });
 
   beforeEach(() => {
-    envSnapshot = captureFullEnv();
+    envSnapshot = captureEnv(["OPENCLAW_BUNDLED_SKILLS_DIR"]);
   });
 
   afterEach(() => {
     envSnapshot.restore();
   });
 
+  afterAll(async () => {
+    if (tempRoot) {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   const runContext = async (workspaceAccess: "none" | "ro") => {
-    const bundledDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-bundled-skills-"));
+    const bundledDir = await fs.mkdtemp(path.join(tempRoot, "bundled-"));
     await fs.mkdir(bundledDir, { recursive: true });
 
     process.env.OPENCLAW_BUNDLED_SKILLS_DIR = bundledDir;
 
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-workspace-"));
+    const workspaceDir = await fs.mkdtemp(path.join(tempRoot, "workspace-"));
     await writeSkill({
       dir: path.join(workspaceDir, "skills", "demo-skill"),
       name: "demo-skill",
@@ -65,19 +76,15 @@ describe("sandbox skill mirroring", () => {
     return { context, workspaceDir };
   };
 
-  it("copies skills into the sandbox when workspaceAccess is ro", async () => {
-    const { context } = await runContext("ro");
+  it.each(["ro", "none"] as const)(
+    "copies skills into the sandbox when workspaceAccess is %s",
+    async (workspaceAccess) => {
+      const { context } = await runContext(workspaceAccess);
 
-    expect(context?.enabled).toBe(true);
-    const skillPath = path.join(context?.workspaceDir ?? "", "skills", "demo-skill", "SKILL.md");
-    await expect(fs.readFile(skillPath, "utf-8")).resolves.toContain("demo-skill");
-  }, 20_000);
-
-  it("copies skills into the sandbox when workspaceAccess is none", async () => {
-    const { context } = await runContext("none");
-
-    expect(context?.enabled).toBe(true);
-    const skillPath = path.join(context?.workspaceDir ?? "", "skills", "demo-skill", "SKILL.md");
-    await expect(fs.readFile(skillPath, "utf-8")).resolves.toContain("demo-skill");
-  }, 20_000);
+      expect(context?.enabled).toBe(true);
+      const skillPath = path.join(context?.workspaceDir ?? "", "skills", "demo-skill", "SKILL.md");
+      await expect(fs.readFile(skillPath, "utf-8")).resolves.toContain("demo-skill");
+    },
+    20_000,
+  );
 });

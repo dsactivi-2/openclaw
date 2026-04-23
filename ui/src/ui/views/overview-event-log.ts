@@ -6,7 +6,6 @@ import { formatEventPayload } from "../presenter.ts";
 
 export type OverviewEventLogProps = {
   events: EventLogEntry[];
-  redacted: boolean;
 };
 
 export function renderOverviewEventLog(props: OverviewEventLogProps) {
@@ -17,23 +16,23 @@ export function renderOverviewEventLog(props: OverviewEventLogProps) {
   const visible = props.events.slice(0, 20);
 
   return html`
-    <details class="card ov-event-log">
+    <details class="card ov-event-log" open>
       <summary class="ov-expandable-toggle">
         <span class="nav-item__icon">${icons.radio}</span>
         ${t("overview.eventLog.title")}
         <span class="ov-count-badge">${props.events.length}</span>
       </summary>
-      <div class="ov-event-log-list ${props.redacted ? "redacted" : ""}">
+      <div class="ov-event-log-list">
         ${visible.map(
           (entry) => html`
             <div class="ov-event-log-entry">
               <span class="ov-event-log-ts">${new Date(entry.ts).toLocaleTimeString()}</span>
               <span class="ov-event-log-name">${entry.event}</span>
-              ${
-                entry.payload
-                  ? html`<span class="ov-event-log-payload muted">${formatEventPayload(entry.payload).slice(0, 120)}</span>`
-                  : nothing
-              }
+              ${entry.payload
+                ? html`<span class="ov-event-log-payload muted"
+                    >${formatEventPayload(entry.payload).slice(0, 120)}</span
+                  >`
+                : nothing}
             </div>
           `,
         )}

@@ -4,27 +4,37 @@ import {
   resolveSessionFilePath,
   resolveSessionFilePathOptions,
 } from "../../config/sessions/paths.js";
-import type { SessionEntry, SessionSystemPromptReport } from "../../config/sessions/types.js";
+import type { SessionEntry } from "../../config/sessions/types.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { loadProviderUsageSummary } from "../../infra/provider-usage.js";
 import type {
   CostUsageSummary,
-  SessionCostSummary,
-  SessionDailyLatency,
   SessionDailyModelUsage,
   SessionMessageCounts,
-  SessionLatencyStats,
   SessionModelUsage,
-  SessionToolUsage,
 } from "../../infra/session-cost-usage.js";
 import {
   loadCostUsageSummary,
+  loadSessionLogs,
   loadSessionCostSummary,
   loadSessionUsageTimeSeries,
   discoverAllSessions,
+  resolveExistingUsageSessionFile,
   type DiscoveredSession,
 } from "../../infra/session-cost-usage.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
-import { buildUsageAggregateTail } from "../../shared/usage-aggregates.js";
+import { resolvePreferredSessionKeyForSessionIdMatches } from "../../sessions/session-id-resolution.js";
+import { normalizeOptionalString } from "../../shared/string-coerce.js";
+import {
+  buildUsageAggregateTail,
+  mergeUsageDailyLatency,
+  mergeUsageLatency,
+} from "../../shared/usage-aggregates.js";
+import type {
+  SessionUsageEntry,
+  SessionsUsageAggregates,
+  SessionsUsageResult,
+} from "../../shared/usage-types.js";
 import {
   ErrorCodes,
   errorShape,
@@ -39,6 +49,7 @@ import {
 import type { GatewayRequestHandlers, RespondFn } from "./types.js";
 
 const COST_USAGE_CACHE_TTL_MS = 30_000;
+const COST_USAGE_CACHE_MAX = 256;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 type DateRange = { startMs: number; endMs: number };
@@ -54,11 +65,32 @@ type CostUsageCacheEntry = {
 
 const costUsageCache = new Map<string, CostUsageCacheEntry>();
 
+function findCostUsageCacheEvictionKey(): string | undefined {
+  for (const [key, entry] of costUsageCache) {
+    if (!entry.inFlight) {
+      return key;
+    }
+  }
+  return costUsageCache.keys().next().value;
+}
+
+// Keep the cache bounded while preserving in-flight request coalescing when a
+// settled entry is available to evict.
+function setCostUsageCache(cacheKey: string, entry: CostUsageCacheEntry): void {
+  if (!costUsageCache.has(cacheKey) && costUsageCache.size >= COST_USAGE_CACHE_MAX) {
+    const evictKey = findCostUsageCacheEvictionKey();
+    if (evictKey !== undefined) {
+      costUsageCache.delete(evictKey);
+    }
+  }
+  costUsageCache.set(cacheKey, entry);
+}
+
 function resolveSessionUsageFileOrRespond(
   key: string,
   respond: RespondFn,
 ): {
-  config: ReturnType<typeof loadConfig>;
+  config: OpenClawConfig;
   entry: SessionEntry | undefined;
   agentId: string | undefined;
   sessionId: string;
@@ -246,17 +278,32 @@ type DiscoveredSessionWithAgent = DiscoveredSession & { agentId: string };
 function buildStoreBySessionId(
   store: Record<string, SessionEntry>,
 ): Map<string, { key: string; entry: SessionEntry }> {
-  const storeBySessionId = new Map<string, { key: string; entry: SessionEntry }>();
+  const matchesBySessionId = new Map<string, Array<[string, SessionEntry]>>();
   for (const [key, entry] of Object.entries(store)) {
-    if (entry?.sessionId) {
-      storeBySessionId.set(entry.sessionId, { key, entry });
+    if (!entry?.sessionId) {
+      continue;
+    }
+    const matches = matchesBySessionId.get(entry.sessionId) ?? [];
+    matches.push([key, entry]);
+    matchesBySessionId.set(entry.sessionId, matches);
+  }
+
+  const storeBySessionId = new Map<string, { key: string; entry: SessionEntry }>();
+  for (const [sessionId, matches] of matchesBySessionId) {
+    const preferredKey = resolvePreferredSessionKeyForSessionIdMatches(matches, sessionId);
+    if (!preferredKey) {
+      continue;
+    }
+    const preferredEntry = store[preferredKey];
+    if (preferredEntry) {
+      storeBySessionId.set(sessionId, { key: preferredKey, entry: preferredEntry });
     }
   }
   return storeBySessionId;
 }
 
 async function discoverAllSessionsForUsage(params: {
-  config: ReturnType<typeof loadConfig>;
+  config: OpenClawConfig;
   startMs: number;
   endMs: number;
 }): Promise<DiscoveredSessionWithAgent[]> {
@@ -268,7 +315,7 @@ async function discoverAllSessionsForUsage(params: {
         startMs: params.startMs,
         endMs: params.endMs,
       });
-      return sessions.map((session) => ({ ...session, agentId: agent.id }));
+      return sessions.map((session) => Object.assign({}, session, { agentId: agent.id }));
     }),
   );
   return results.flat().toSorted((a, b) => b.mtime - a.mtime);
@@ -277,7 +324,7 @@ async function discoverAllSessionsForUsage(params: {
 async function loadCostUsageSummaryCached(params: {
   startMs: number;
   endMs: number;
-  config: ReturnType<typeof loadConfig>;
+  config: OpenClawConfig;
 }): Promise<CostUsageSummary> {
   const cacheKey = `${params.startMs}-${params.endMs}`;
   const now = Date.now();
@@ -300,7 +347,7 @@ async function loadCostUsageSummaryCached(params: {
     config: params.config,
   })
     .then((summary) => {
-      costUsageCache.set(cacheKey, { summary, updatedAt: Date.now() });
+      setCostUsageCache(cacheKey, { summary, updatedAt: Date.now() });
       return summary;
     })
     .catch((err) => {
@@ -313,12 +360,12 @@ async function loadCostUsageSummaryCached(params: {
       const current = costUsageCache.get(cacheKey);
       if (current?.inFlight === inFlight) {
         current.inFlight = undefined;
-        costUsageCache.set(cacheKey, current);
+        setCostUsageCache(cacheKey, current);
       }
     });
 
   entry.inFlight = inFlight;
-  costUsageCache.set(cacheKey, entry);
+  setCostUsageCache(cacheKey, entry);
 
   if (entry.summary) {
     return entry.summary;
@@ -340,60 +387,7 @@ export const __test = {
   costUsageCache,
 };
 
-export type SessionUsageEntry = {
-  key: string;
-  label?: string;
-  sessionId?: string;
-  updatedAt?: number;
-  agentId?: string;
-  channel?: string;
-  chatType?: string;
-  origin?: {
-    label?: string;
-    provider?: string;
-    surface?: string;
-    chatType?: string;
-    from?: string;
-    to?: string;
-    accountId?: string;
-    threadId?: string | number;
-  };
-  modelOverride?: string;
-  providerOverride?: string;
-  modelProvider?: string;
-  model?: string;
-  usage: SessionCostSummary | null;
-  contextWeight?: SessionSystemPromptReport | null;
-};
-
-export type SessionsUsageAggregates = {
-  messages: SessionMessageCounts;
-  tools: SessionToolUsage;
-  byModel: SessionModelUsage[];
-  byProvider: SessionModelUsage[];
-  byAgent: Array<{ agentId: string; totals: CostUsageSummary["totals"] }>;
-  byChannel: Array<{ channel: string; totals: CostUsageSummary["totals"] }>;
-  latency?: SessionLatencyStats;
-  dailyLatency?: SessionDailyLatency[];
-  modelDaily?: SessionDailyModelUsage[];
-  daily: Array<{
-    date: string;
-    tokens: number;
-    cost: number;
-    messages: number;
-    toolCalls: number;
-    errors: number;
-  }>;
-};
-
-export type SessionsUsageResult = {
-  updatedAt: number;
-  startDate: string;
-  endDate: string;
-  sessions: SessionUsageEntry[];
-  totals: CostUsageSummary["totals"];
-  aggregates: SessionsUsageAggregates;
-};
+export type { SessionUsageEntry, SessionsUsageAggregates, SessionsUsageResult };
 
 export const usageHandlers: GatewayRequestHandlers = {
   "usage.status": async ({ respond }) => {
@@ -435,7 +429,7 @@ export const usageHandlers: GatewayRequestHandlers = {
     });
     const limit = typeof p.limit === "number" && Number.isFinite(p.limit) ? p.limit : 50;
     const includeContextWeight = p.includeContextWeight ?? false;
-    const specificKey = typeof p.key === "string" ? p.key.trim() : null;
+    const specificKey = normalizeOptionalString(p.key) ?? null;
 
     // Load session store for named sessions
     const { storePath, store } = loadCombinedSessionStoreForGateway(config);
@@ -473,13 +467,18 @@ export const usageHandlers: GatewayRequestHandlers = {
       const sessionId = storeEntry?.sessionId ?? keyRest;
 
       // Resolve the session file path
-      let sessionFile: string;
+      let sessionFile: string | undefined;
       try {
         const pathOpts = resolveSessionFilePathOptions({
           storePath: storePath !== "(multiple)" ? storePath : undefined,
           agentId: agentIdFromKey,
         });
-        sessionFile = resolveSessionFilePath(sessionId, storeEntry, pathOpts);
+        sessionFile = resolveExistingUsageSessionFile({
+          sessionId,
+          sessionEntry: storeEntry,
+          sessionFile: resolveSessionFilePath(sessionId, storeEntry, pathOpts),
+          agentId: agentIdFromKey,
+        });
       } catch {
         respond(
           false,
@@ -489,20 +488,22 @@ export const usageHandlers: GatewayRequestHandlers = {
         return;
       }
 
-      try {
-        const stats = fs.statSync(sessionFile);
-        if (stats.isFile()) {
-          mergedEntries.push({
-            key: resolvedStoreKey,
-            sessionId,
-            sessionFile,
-            label: storeEntry?.label,
-            updatedAt: storeEntry?.updatedAt ?? stats.mtimeMs,
-            storeEntry,
-          });
+      if (sessionFile) {
+        try {
+          const stats = fs.statSync(sessionFile);
+          if (stats.isFile()) {
+            mergedEntries.push({
+              key: resolvedStoreKey,
+              sessionId,
+              sessionFile,
+              label: storeEntry?.label,
+              updatedAt: storeEntry?.updatedAt ?? stats.mtimeMs,
+              storeEntry,
+            });
+          }
+        } catch {
+          // File doesn't exist - no results for this key
         }
-      } catch {
-        // File doesn't exist - no results for this key
       }
     } else {
       // Full discovery for list view
@@ -704,35 +705,8 @@ export const usageHandlers: GatewayRequestHandlers = {
           }
         }
 
-        if (usage.latency) {
-          const { count, avgMs, minMs, maxMs, p95Ms } = usage.latency;
-          if (count > 0) {
-            latencyTotals.count += count;
-            latencyTotals.sum += avgMs * count;
-            latencyTotals.min = Math.min(latencyTotals.min, minMs);
-            latencyTotals.max = Math.max(latencyTotals.max, maxMs);
-            latencyTotals.p95Max = Math.max(latencyTotals.p95Max, p95Ms);
-          }
-        }
-
-        if (usage.dailyLatency) {
-          for (const day of usage.dailyLatency) {
-            const existing = dailyLatencyMap.get(day.date) ?? {
-              date: day.date,
-              count: 0,
-              sum: 0,
-              min: Number.POSITIVE_INFINITY,
-              max: 0,
-              p95Max: 0,
-            };
-            existing.count += day.count;
-            existing.sum += day.avgMs * day.count;
-            existing.min = Math.min(existing.min, day.minMs);
-            existing.max = Math.max(existing.max, day.maxMs);
-            existing.p95Max = Math.max(existing.p95Max, day.p95Ms);
-            dailyLatencyMap.set(day.date, existing);
-          }
-        }
+        mergeUsageLatency(latencyTotals, usage.latency);
+        mergeUsageDailyLatency(dailyLatencyMap, usage.dailyLatency);
 
         if (usage.dailyModelUsage) {
           for (const entry of usage.dailyModelUsage) {
@@ -844,22 +818,22 @@ export const usageHandlers: GatewayRequestHandlers = {
           .toSorted((a, b) => b.count - a.count),
       },
       byModel: Array.from(byModelMap.values()).toSorted((a, b) => {
-        const costDiff = b.totals.totalCost - a.totals.totalCost;
+        const costDiff = (b.totals?.totalCost ?? 0) - (a.totals?.totalCost ?? 0);
         if (costDiff !== 0) {
           return costDiff;
         }
-        return b.totals.totalTokens - a.totals.totalTokens;
+        return (b.totals?.totalTokens ?? 0) - (a.totals?.totalTokens ?? 0);
       }),
       byProvider: Array.from(byProviderMap.values()).toSorted((a, b) => {
-        const costDiff = b.totals.totalCost - a.totals.totalCost;
+        const costDiff = (b.totals?.totalCost ?? 0) - (a.totals?.totalCost ?? 0);
         if (costDiff !== 0) {
           return costDiff;
         }
-        return b.totals.totalTokens - a.totals.totalTokens;
+        return (b.totals?.totalTokens ?? 0) - (a.totals?.totalTokens ?? 0);
       }),
       byAgent: Array.from(byAgentMap.entries())
         .map(([id, totals]) => ({ agentId: id, totals }))
-        .toSorted((a, b) => b.totals.totalCost - a.totals.totalCost),
+        .toSorted((a, b) => (b.totals?.totalCost ?? 0) - (a.totals?.totalCost ?? 0)),
       ...tail,
     };
 
@@ -875,7 +849,7 @@ export const usageHandlers: GatewayRequestHandlers = {
     respond(true, result, undefined);
   },
   "sessions.usage.timeseries": async ({ respond, params }) => {
-    const key = typeof params?.key === "string" ? params.key.trim() : null;
+    const key = normalizeOptionalString(params?.key) ?? null;
     if (!key) {
       respond(
         false,
@@ -912,7 +886,7 @@ export const usageHandlers: GatewayRequestHandlers = {
     respond(true, timeseries, undefined);
   },
   "sessions.usage.logs": async ({ respond, params }) => {
-    const key = typeof params?.key === "string" ? params.key.trim() : null;
+    const key = normalizeOptionalString(params?.key) ?? null;
     if (!key) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "key is required for logs"));
       return;
@@ -929,7 +903,6 @@ export const usageHandlers: GatewayRequestHandlers = {
     }
     const { config, entry, agentId, sessionId, sessionFile } = resolved;
 
-    const { loadSessionLogs } = await import("../../infra/session-cost-usage.js");
     const logs = await loadSessionLogs({
       sessionId,
       sessionEntry: entry,

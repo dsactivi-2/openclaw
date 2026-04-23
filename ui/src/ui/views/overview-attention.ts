@@ -1,5 +1,6 @@
 import { html, nothing } from "lit";
 import { t } from "../../i18n/index.ts";
+import { buildExternalLinkRel, EXTERNAL_LINK_TARGET } from "../external-link.ts";
 import { icons, type IconName } from "../icons.ts";
 import type { AttentionItem } from "../types.ts";
 
@@ -41,16 +42,15 @@ export function renderOverviewAttention(props: OverviewAttentionProps) {
                 <div class="ov-attention-title">${item.title}</div>
                 <div class="muted">${item.description}</div>
               </div>
-              ${
-                item.href
-                  ? html`<a
+              ${item.href
+                ? html`<a
                     class="ov-attention-link"
                     href=${item.href}
-                    target=${item.external ? "_blank" : ""}
-                    rel=${item.external ? "noreferrer" : ""}
-                  >${t("common.docs")}</a>`
-                  : nothing
-              }
+                    target=${item.external ? EXTERNAL_LINK_TARGET : nothing}
+                    rel=${item.external ? buildExternalLinkRel() : nothing}
+                    >${t("common.docs")}</a
+                  >`
+                : nothing}
             </div>
           `,
         )}

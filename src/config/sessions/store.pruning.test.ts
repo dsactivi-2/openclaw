@@ -1,28 +1,27 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { capEntryCount, pruneStaleEntries, rotateSessionFile } from "./store.js";
+import { createFixtureSuite } from "../../test-utils/fixture-suite.js";
+import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
+import {
+  capEntryCount,
+  getActiveSessionMaintenanceWarning,
+  pruneStaleEntries,
+  rotateSessionFile,
+} from "./store.js";
 import type { SessionEntry } from "./types.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-let fixtureRoot = "";
-let fixtureCount = 0;
-
-async function createCaseDir(prefix: string): Promise<string> {
-  const dir = path.join(fixtureRoot, `${prefix}-${fixtureCount++}`);
-  await fs.mkdir(dir, { recursive: true });
-  return dir;
-}
+const fixtureSuite = createFixtureSuite("openclaw-pruning-suite-");
 
 beforeAll(async () => {
-  fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-pruning-suite-"));
+  await fixtureSuite.setup();
 });
 
 afterAll(async () => {
-  await fs.rm(fixtureRoot, { recursive: true, force: true });
+  await fixtureSuite.cleanup();
 });
 
 function makeEntry(updatedAt: number): SessionEntry {
@@ -77,12 +76,62 @@ describe("capEntryCount", () => {
   });
 });
 
+describe("resolveMaintenanceConfigFromInput", () => {
+  it("defaults to enforcing session maintenance", () => {
+    const maintenance = resolveMaintenanceConfigFromInput();
+
+    expect(maintenance.mode).toBe("enforce");
+  });
+});
+
+describe("getActiveSessionMaintenanceWarning", () => {
+  it("warns when the active session is outside the retained recent entries", () => {
+    const now = Date.now();
+    const store = makeStore([
+      ["newest", makeEntry(now)],
+      ["recent", makeEntry(now - 1)],
+      ["active", makeEntry(now - 2)],
+      ["old", makeEntry(now - 3)],
+    ]);
+
+    const warning = getActiveSessionMaintenanceWarning({
+      store,
+      activeSessionKey: "active",
+      pruneAfterMs: DAY_MS,
+      maxEntries: 2,
+      nowMs: now,
+    });
+
+    expect(warning?.wouldCap).toBe(true);
+    expect(warning?.wouldPrune).toBe(false);
+  });
+
+  it("preserves insertion order tie behavior from stable sorting", () => {
+    const now = Date.now();
+    const store = makeStore([
+      ["same-before", makeEntry(now)],
+      ["active", makeEntry(now)],
+      ["same-after", makeEntry(now)],
+    ]);
+
+    const warning = getActiveSessionMaintenanceWarning({
+      store,
+      activeSessionKey: "active",
+      pruneAfterMs: DAY_MS,
+      maxEntries: 1,
+      nowMs: now,
+    });
+
+    expect(warning?.wouldCap).toBe(true);
+  });
+});
+
 describe("rotateSessionFile", () => {
   let testDir: string;
   let storePath: string;
 
   beforeEach(async () => {
-    testDir = await createCaseDir("rotate");
+    testDir = await fixtureSuite.createCaseDir("rotate");
     storePath = path.join(testDir, "sessions.json");
   });
 
@@ -105,7 +154,8 @@ describe("rotateSessionFile", () => {
     let now = Date.now();
     const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => (now += 5));
     try {
-      for (let i = 0; i < 5; i++) {
+      // 4 rotations are enough to verify pruning to <=3 backups.
+      for (let i = 0; i < 4; i++) {
         await fs.writeFile(storePath, `data-${i}-${"x".repeat(100)}`, "utf-8");
         await rotateSessionFile(storePath, 50);
       }

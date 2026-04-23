@@ -43,6 +43,40 @@ describe("hooks mapping", () => {
     });
   }
 
+  function expectAgentMessage(
+    result: Awaited<ReturnType<typeof applyHookMappings>> | undefined,
+    expectedMessage: string,
+  ) {
+    expect(result?.ok).toBe(true);
+    if (result?.ok && result.action?.kind === "agent") {
+      expect(result.action.kind).toBe("agent");
+      expect(result.action.message).toBe(expectedMessage);
+    }
+  }
+
+  async function expectBlockedPrototypeTraversal(params: {
+    id: string;
+    messageTemplate: string;
+    payload: Record<string, unknown>;
+    expectedMessage: string;
+  }) {
+    const mappings = resolveHookMappings({
+      mappings: [
+        createGmailAgentMapping({
+          id: params.id,
+          messageTemplate: params.messageTemplate,
+        }),
+      ],
+    });
+    const result = await applyHookMappings(mappings, {
+      payload: params.payload,
+      headers: {},
+      url: baseUrl,
+      path: "gmail",
+    });
+    expectAgentMessage(result, params.expectedMessage);
+  }
+
   async function applyNullTransformFromTempConfig(params: {
     configDir: string;
     transformsDir?: string;
@@ -91,11 +125,7 @@ describe("hooks mapping", () => {
         }),
       ],
     });
-    expect(result?.ok).toBe(true);
-    if (result?.ok && result.action?.kind === "agent") {
-      expect(result.action.kind).toBe("agent");
-      expect(result.action.message).toBe("Subject: Hello");
-    }
+    expectAgentMessage(result, "Subject: Hello");
   });
 
   it("passes model override from mapping", async () => {
@@ -111,6 +141,44 @@ describe("hooks mapping", () => {
     expect(result?.ok).toBe(true);
     if (result?.ok && result.action && result.action.kind === "agent") {
       expect(result.action.model).toBe("openai/gpt-4.1-mini");
+    }
+  });
+
+  it("marks template-derived session keys as templated", async () => {
+    const result = await applyGmailMappings({
+      mappings: [
+        {
+          id: "templated-session-key",
+          match: { path: "gmail" },
+          action: "agent",
+          messageTemplate: "Subject: {{messages[0].subject}}",
+          sessionKey: "hook:gmail:{{messages[0].subject}}",
+        },
+      ],
+    });
+    expect(result?.ok).toBe(true);
+    if (result?.ok && result.action?.kind === "agent") {
+      expect(result.action.sessionKey).toBe("hook:gmail:Hello");
+      expect(result.action.sessionKeySource).toBe("templated");
+    }
+  });
+
+  it("marks literal session keys as static", async () => {
+    const result = await applyGmailMappings({
+      mappings: [
+        {
+          id: "static-session-key",
+          match: { path: "gmail" },
+          action: "agent",
+          messageTemplate: "Subject: {{messages[0].subject}}",
+          sessionKey: "hook:gmail:static",
+        },
+      ],
+    });
+    expect(result?.ok).toBe(true);
+    if (result?.ok && result.action?.kind === "agent") {
+      expect(result.action.sessionKey).toBe("hook:gmail:static");
+      expect(result.action.sessionKeySource).toBe("static");
     }
   });
 
@@ -149,6 +217,184 @@ describe("hooks mapping", () => {
     if (result?.ok && result.action?.kind === "wake") {
       expect(result.action.kind).toBe("wake");
       expect(result.action.text).toBe("Ping Ada");
+    }
+  });
+
+  it("treats transform-provided session keys as templated by default", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-config-sessionkey-xform-"));
+    const transformsRoot = path.join(configDir, "hooks", "transforms");
+    fs.mkdirSync(transformsRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(transformsRoot, "transform.mjs"),
+      [
+        "export default ({ payload }) => ({",
+        '  kind: "agent",',
+        '  message: "Transformed",',
+        "  sessionKey: `hook:gmail:${payload.subject}`,",
+        "});",
+      ].join("\n"),
+    );
+
+    const mappings = resolveHookMappings(
+      {
+        mappings: [
+          {
+            match: { path: "gmail" },
+            action: "agent",
+            messageTemplate: "Subject: {{messages[0].subject}}",
+            sessionKey: "hook:gmail:static",
+            transform: { module: "transform.mjs" },
+          },
+        ],
+      },
+      { configDir },
+    );
+
+    const result = await applyHookMappings(mappings, {
+      payload: { subject: "external" },
+      headers: {},
+      url: baseUrl,
+      path: "gmail",
+    });
+
+    expect(result?.ok).toBe(true);
+    if (result?.ok && result.action?.kind === "agent") {
+      expect(result.action.sessionKey).toBe("hook:gmail:external");
+      expect(result.action.sessionKeySource).toBe("templated");
+    }
+  });
+
+  it("uses transform-provided static session key source metadata", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-config-sessionkey-static-"));
+    const transformsRoot = path.join(configDir, "hooks", "transforms");
+    fs.mkdirSync(transformsRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(transformsRoot, "transform.mjs"),
+      [
+        "export default () => ({",
+        '  kind: "agent",',
+        '  message: "Transformed",',
+        '  sessionKey: "hook:gmail:fixed",',
+        '  sessionKeySource: "static",',
+        "});",
+      ].join("\n"),
+    );
+
+    const mappings = resolveHookMappings(
+      {
+        mappings: [
+          {
+            match: { path: "gmail" },
+            action: "agent",
+            messageTemplate: "Subject: {{messages[0].subject}}",
+            sessionKey: "hook:gmail:{{messages[0].subject}}",
+            transform: { module: "transform.mjs" },
+          },
+        ],
+      },
+      { configDir },
+    );
+
+    const result = await applyHookMappings(mappings, {
+      payload: gmailPayload,
+      headers: {},
+      url: baseUrl,
+      path: "gmail",
+    });
+
+    expect(result?.ok).toBe(true);
+    if (result?.ok && result.action?.kind === "agent") {
+      expect(result.action.sessionKey).toBe("hook:gmail:fixed");
+      expect(result.action.sessionKeySource).toBe("static");
+    }
+  });
+
+  it("treats empty transform session keys as absent for source tracking", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-config-sessionkey-empty-"));
+    const transformsRoot = path.join(configDir, "hooks", "transforms");
+    fs.mkdirSync(transformsRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(transformsRoot, "transform.mjs"),
+      [
+        "export default () => ({",
+        '  kind: "agent",',
+        '  message: "Transformed",',
+        '  sessionKey: "",',
+        '  sessionKeySource: "templated",',
+        "});",
+      ].join("\n"),
+    );
+
+    const mappings = resolveHookMappings(
+      {
+        mappings: [
+          {
+            match: { path: "gmail" },
+            action: "agent",
+            messageTemplate: "Subject: {{messages[0].subject}}",
+            sessionKey: "hook:gmail:{{messages[0].subject}}",
+            transform: { module: "transform.mjs" },
+          },
+        ],
+      },
+      { configDir },
+    );
+
+    const result = await applyHookMappings(mappings, {
+      payload: gmailPayload,
+      headers: {},
+      url: baseUrl,
+      path: "gmail",
+    });
+
+    expect(result?.ok).toBe(true);
+    if (result?.ok && result.action?.kind === "agent") {
+      expect(result.action.sessionKey).toBe("");
+      expect(result.action.sessionKeySource).toBeUndefined();
+    }
+  });
+
+  it("defaults invalid transform session key source metadata to templated", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-config-sessionkey-invalid-"));
+    const transformsRoot = path.join(configDir, "hooks", "transforms");
+    fs.mkdirSync(transformsRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(transformsRoot, "transform.mjs"),
+      [
+        "export default () => ({",
+        '  kind: "agent",',
+        '  message: "Transformed",',
+        '  sessionKey: "hook:gmail:from-transform",',
+        '  sessionKeySource: "bogus",',
+        "});",
+      ].join("\n"),
+    );
+
+    const mappings = resolveHookMappings(
+      {
+        mappings: [
+          {
+            match: { path: "gmail" },
+            action: "agent",
+            messageTemplate: "Subject: {{messages[0].subject}}",
+            transform: { module: "transform.mjs" },
+          },
+        ],
+      },
+      { configDir },
+    );
+
+    const result = await applyHookMappings(mappings, {
+      payload: gmailPayload,
+      headers: {},
+      url: baseUrl,
+      path: "gmail",
+    });
+
+    expect(result?.ok).toBe(true);
+    if (result?.ok && result.action?.kind === "agent") {
+      expect(result.action.sessionKey).toBe("hook:gmail:from-transform");
+      expect(result.action.sessionKeySource).toBe("templated");
     }
   });
 
@@ -342,11 +588,7 @@ describe("hooks mapping", () => {
         }),
       ],
     });
-    expect(result?.ok).toBe(true);
-    if (result?.ok && result.action?.kind === "agent") {
-      expect(result.action.kind).toBe("agent");
-      expect(result.action.message).toBe("Override subject: Hello");
-    }
+    expectAgentMessage(result, "Override subject: Hello");
   });
 
   it("passes agentId from mapping", async () => {
@@ -461,75 +703,30 @@ describe("hooks mapping", () => {
 
   describe("prototype pollution protection", () => {
     it("blocks __proto__ traversal in webhook payload", async () => {
-      const mappings = resolveHookMappings({
-        mappings: [
-          createGmailAgentMapping({
-            id: "proto-test",
-            messageTemplate: "value: {{__proto__}}",
-          }),
-        ],
-      });
-      const result = await applyHookMappings(mappings, {
+      await expectBlockedPrototypeTraversal({
+        id: "proto-test",
+        messageTemplate: "value: {{__proto__}}",
         payload: { __proto__: { polluted: true } } as Record<string, unknown>,
-        headers: {},
-        url: baseUrl,
-        path: "gmail",
+        expectedMessage: "value: ",
       });
-      expect(result?.ok).toBe(true);
-      if (result?.ok) {
-        const action = result.action;
-        if (action?.kind === "agent") {
-          expect(action.message).toBe("value: ");
-        }
-      }
     });
 
     it("blocks constructor traversal in webhook payload", async () => {
-      const mappings = resolveHookMappings({
-        mappings: [
-          createGmailAgentMapping({
-            id: "constructor-test",
-            messageTemplate: "type: {{constructor.name}}",
-          }),
-        ],
-      });
-      const result = await applyHookMappings(mappings, {
+      await expectBlockedPrototypeTraversal({
+        id: "constructor-test",
+        messageTemplate: "type: {{constructor.name}}",
         payload: { constructor: { name: "INJECTED" } } as Record<string, unknown>,
-        headers: {},
-        url: baseUrl,
-        path: "gmail",
+        expectedMessage: "type: ",
       });
-      expect(result?.ok).toBe(true);
-      if (result?.ok) {
-        const action = result.action;
-        if (action?.kind === "agent") {
-          expect(action.message).toBe("type: ");
-        }
-      }
     });
 
     it("blocks prototype traversal in webhook payload", async () => {
-      const mappings = resolveHookMappings({
-        mappings: [
-          createGmailAgentMapping({
-            id: "prototype-test",
-            messageTemplate: "val: {{prototype}}",
-          }),
-        ],
-      });
-      const result = await applyHookMappings(mappings, {
+      await expectBlockedPrototypeTraversal({
+        id: "prototype-test",
+        messageTemplate: "val: {{prototype}}",
         payload: { prototype: "leaked" } as Record<string, unknown>,
-        headers: {},
-        url: baseUrl,
-        path: "gmail",
+        expectedMessage: "val: ",
       });
-      expect(result?.ok).toBe(true);
-      if (result?.ok) {
-        const action = result.action;
-        if (action?.kind === "agent") {
-          expect(action.message).toBe("val: ");
-        }
-      }
     });
   });
 });

@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { packNpmSpecToArchive, withTempDir } from "./install-source-utils.js";
 import type { NpmIntegrityDriftPayload } from "./npm-integrity.js";
-import { installFromNpmSpecArchive } from "./npm-pack-install.js";
+import {
+  finalizeNpmSpecArchiveInstall,
+  installFromNpmSpecArchive,
+  installFromNpmSpecArchiveWithInstaller,
+} from "./npm-pack-install.js";
 
-vi.mock("./install-source-utils.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./install-source-utils.js")>();
+vi.mock("./install-source-utils.js", async () => {
+  const actual = await vi.importActual<typeof import("./install-source-utils.js")>(
+    "./install-source-utils.js",
+  );
   return {
     ...actual,
     withTempDir: vi.fn(async (_prefix: string, fn: (tmpDir: string) => Promise<unknown>) => {
@@ -85,6 +91,24 @@ describe("installFromNpmSpecArchive", () => {
     expect(result).toEqual({ ok: false, error: "pack failed" });
     expect(installFromArchive).not.toHaveBeenCalled();
     expect(withTempDir).toHaveBeenCalledWith("openclaw-test-", expect.any(Function));
+  });
+
+  it("rejects unsupported npm specs before packing", async () => {
+    const installFromArchive = vi.fn(async () => ({ ok: true as const }));
+
+    const result = await installFromNpmSpecArchive({
+      tempDirPrefix: "openclaw-test-",
+      spec: "file:/tmp/openclaw.tgz",
+      timeoutMs: 1000,
+      installFromArchive,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: "unsupported npm spec",
+    });
+    expect(packNpmSpecToArchive).not.toHaveBeenCalled();
+    expect(installFromArchive).not.toHaveBeenCalled();
   });
 
   it("returns resolution metadata and installer result on success", async () => {
@@ -171,5 +195,151 @@ describe("installFromNpmSpecArchive", () => {
 
     const okResult = expectWrappedOkResult(result, { ok: false, error: "install failed" });
     expect(okResult.integrityDrift).toBeUndefined();
+  });
+
+  it("rejects prerelease resolutions unless explicitly requested", async () => {
+    vi.mocked(packNpmSpecToArchive).mockResolvedValue({
+      ok: true,
+      archivePath: baseArchivePath,
+      metadata: {
+        resolvedSpec: "@openclaw/test@latest",
+        integrity: "sha512-same",
+        version: "1.1.0-beta.1",
+      },
+    });
+    const installFromArchive = vi.fn(async () => ({ ok: true as const }));
+
+    const result = await installFromNpmSpecArchive({
+      tempDirPrefix: "openclaw-test-",
+      spec: "@openclaw/test@latest",
+      timeoutMs: 1000,
+      installFromArchive,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      throw new Error("expected prerelease rejection");
+    }
+    expect(result.error).toContain("prerelease version 1.1.0-beta.1");
+    expect(installFromArchive).not.toHaveBeenCalled();
+  });
+
+  it("allows prerelease resolutions when explicitly requested by tag", async () => {
+    vi.mocked(packNpmSpecToArchive).mockResolvedValue({
+      ok: true,
+      archivePath: baseArchivePath,
+      metadata: {
+        resolvedSpec: "@openclaw/test@beta",
+        integrity: "sha512-same",
+        version: "1.1.0-beta.1",
+      },
+    });
+    const installFromArchive = vi.fn(async () => ({ ok: true as const, pluginId: "beta-plugin" }));
+
+    const result = await installFromNpmSpecArchive({
+      tempDirPrefix: "openclaw-test-",
+      spec: "@openclaw/test@beta",
+      timeoutMs: 1000,
+      installFromArchive,
+    });
+
+    const okResult = expectWrappedOkResult(result, { ok: true, pluginId: "beta-plugin" });
+    expect(okResult.npmResolution.version).toBe("1.1.0-beta.1");
+  });
+});
+
+describe("installFromNpmSpecArchiveWithInstaller", () => {
+  beforeEach(() => {
+    vi.mocked(packNpmSpecToArchive).mockClear();
+  });
+
+  it("passes archive path and installer params to installFromArchive", async () => {
+    vi.mocked(packNpmSpecToArchive).mockResolvedValue({
+      ok: true,
+      archivePath: "/tmp/openclaw-plugin.tgz",
+      metadata: {
+        resolvedSpec: "@openclaw/voice-call@1.0.0",
+        integrity: "sha512-same",
+      },
+    });
+    const installFromArchive = vi.fn(
+      async (_params: { archivePath: string; pluginId: string }) =>
+        ({ ok: true as const, pluginId: "voice-call" }) as const,
+    );
+
+    const result = await installFromNpmSpecArchiveWithInstaller({
+      tempDirPrefix: "openclaw-test-",
+      spec: "@openclaw/voice-call@1.0.0",
+      timeoutMs: 1000,
+      installFromArchive,
+      archiveInstallParams: { pluginId: "voice-call" },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(installFromArchive).toHaveBeenCalledWith({
+      archivePath: "/tmp/openclaw-plugin.tgz",
+      pluginId: "voice-call",
+    });
+    expect(result.installResult).toEqual({ ok: true, pluginId: "voice-call" });
+  });
+});
+
+describe("finalizeNpmSpecArchiveInstall", () => {
+  it("returns top-level flow errors unchanged", () => {
+    const result = finalizeNpmSpecArchiveInstall<{ ok: true } | { ok: false; error: string }>({
+      ok: false,
+      error: "pack failed",
+    });
+
+    expect(result).toEqual({ ok: false, error: "pack failed" });
+  });
+
+  it("returns install errors unchanged", () => {
+    const result = finalizeNpmSpecArchiveInstall<{ ok: true } | { ok: false; error: string }>({
+      ok: true,
+      installResult: { ok: false, error: "install failed" },
+      npmResolution: {
+        resolvedSpec: "@openclaw/test@1.0.0",
+        integrity: "sha512-same",
+        resolvedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+
+    expect(result).toEqual({ ok: false, error: "install failed" });
+  });
+
+  it("attaches npm metadata to successful install results", () => {
+    const result = finalizeNpmSpecArchiveInstall<
+      { ok: true; pluginId: string } | { ok: false; error: string }
+    >({
+      ok: true,
+      installResult: { ok: true, pluginId: "voice-call" },
+      npmResolution: {
+        resolvedSpec: "@openclaw/voice-call@1.0.0",
+        integrity: "sha512-same",
+        resolvedAt: "2026-01-01T00:00:00.000Z",
+      },
+      integrityDrift: {
+        expectedIntegrity: "sha512-old",
+        actualIntegrity: "sha512-same",
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      pluginId: "voice-call",
+      npmResolution: {
+        resolvedSpec: "@openclaw/voice-call@1.0.0",
+        integrity: "sha512-same",
+        resolvedAt: "2026-01-01T00:00:00.000Z",
+      },
+      integrityDrift: {
+        expectedIntegrity: "sha512-old",
+        actualIntegrity: "sha512-same",
+      },
+    });
   });
 });

@@ -1,21 +1,27 @@
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   getResolvedConsoleSettings,
   getResolvedLoggerSettings,
   resetLogger,
   setLoggerOverride,
 } from "../logging.js";
+import { createSuiteLogPathTracker } from "./log-test-helpers.js";
 import { loggingState } from "./state.js";
 
-const testLogPath = path.join(os.tmpdir(), "openclaw-test-env-log-level.log");
+const defaultMaxFileBytes = 500 * 1024 * 1024;
+const logPathTracker = createSuiteLogPathTracker("openclaw-test-env-log-level-");
 
 describe("OPENCLAW_LOG_LEVEL", () => {
   let originalEnv: string | undefined;
+  let testLogPath = "";
+
+  beforeAll(async () => {
+    await logPathTracker.setup();
+  });
 
   beforeEach(() => {
     originalEnv = process.env.OPENCLAW_LOG_LEVEL;
+    testLogPath = logPathTracker.nextPath();
     delete process.env.OPENCLAW_LOG_LEVEL;
     loggingState.invalidEnvLogLevelValue = null;
     resetLogger();
@@ -34,6 +40,11 @@ describe("OPENCLAW_LOG_LEVEL", () => {
     vi.restoreAllMocks();
   });
 
+  afterAll(async () => {
+    await logPathTracker.cleanup();
+    testLogPath = "";
+  });
+
   it("applies a valid env override to both file and console levels", () => {
     setLoggerOverride({
       level: "error",
@@ -46,6 +57,7 @@ describe("OPENCLAW_LOG_LEVEL", () => {
     expect(getResolvedLoggerSettings()).toEqual({
       level: "debug",
       file: testLogPath,
+      maxFileBytes: defaultMaxFileBytes,
     });
     expect(getResolvedConsoleSettings()).toEqual({
       level: "debug",
@@ -66,6 +78,7 @@ describe("OPENCLAW_LOG_LEVEL", () => {
     );
 
     expect(getResolvedLoggerSettings().level).toBe("error");
+    expect(getResolvedLoggerSettings().maxFileBytes).toBe(defaultMaxFileBytes);
     expect(getResolvedConsoleSettings().level).toBe("warn");
     expect(getResolvedLoggerSettings().level).toBe("error");
 

@@ -1,5 +1,5 @@
 import { killProcessTree } from "../../kill-tree.js";
-import type { ManagedRunStdin } from "../types.js";
+import type { ManagedRunStdin, SpawnProcessAdapter } from "../types.js";
 import { toStringEnv } from "./env.js";
 
 const FORCE_KILL_WAIT_FALLBACK_MS = 4000;
@@ -32,15 +32,14 @@ type PtyModule = {
   };
 };
 
-export type PtyAdapter = {
-  pid?: number;
-  stdin?: ManagedRunStdin;
-  onStdout: (listener: (chunk: string) => void) => void;
-  onStderr: (listener: (chunk: string) => void) => void;
-  wait: () => Promise<{ code: number | null; signal: NodeJS.Signals | number | null }>;
-  kill: (signal?: NodeJS.Signals) => void;
-  dispose: () => void;
-};
+export type PtyAdapter = SpawnProcessAdapter;
+
+let ptyModulePromise: Promise<PtyModule> | null = null;
+
+async function loadPtyModule(): Promise<PtyModule> {
+  ptyModulePromise ??= import("@lydell/node-pty") as Promise<unknown> as Promise<PtyModule>;
+  return ptyModulePromise;
+}
 
 export async function createPtyAdapter(params: {
   shell: string;
@@ -51,7 +50,7 @@ export async function createPtyAdapter(params: {
   rows?: number;
   name?: string;
 }): Promise<PtyAdapter> {
-  const module = (await import("@lydell/node-pty")) as unknown as PtyModule;
+  const module = await loadPtyModule();
   const spawn = module.spawn ?? module.default?.spawn;
   if (!spawn) {
     throw new Error("PTY support is unavailable (node-pty spawn not found).");
@@ -134,7 +133,7 @@ export async function createPtyAdapter(params: {
   const onStdout = (listener: (chunk: string) => void) => {
     dataListener =
       pty.onData((chunk) => {
-        listener(chunk.toString());
+        listener(chunk);
       }) ?? null;
   };
 

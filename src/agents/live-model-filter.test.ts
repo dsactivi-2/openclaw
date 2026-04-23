@@ -1,14 +1,72 @@
 import { describe, expect, it } from "vitest";
-import { isModernModelRef } from "./live-model-filter.js";
+import { shouldExcludeProviderFromDefaultHighSignalLiveSweep } from "./live-model-filter.js";
 
-describe("isModernModelRef", () => {
-  it("excludes opencode minimax variants from modern selection", () => {
-    expect(isModernModelRef({ provider: "opencode", id: "minimax-m2.1" })).toBe(false);
-    expect(isModernModelRef({ provider: "opencode", id: "minimax-m2.5" })).toBe(false);
+describe("shouldExcludeProviderFromDefaultHighSignalLiveSweep", () => {
+  it("excludes dedicated harness providers from the default high-signal sweep", () => {
+    expect(
+      shouldExcludeProviderFromDefaultHighSignalLiveSweep({
+        provider: "codex",
+        useExplicitModels: false,
+        providerFilter: null,
+      }),
+    ).toBe(true);
+    expect(
+      shouldExcludeProviderFromDefaultHighSignalLiveSweep({
+        provider: "openai-codex",
+        useExplicitModels: false,
+        providerFilter: null,
+      }),
+    ).toBe(true);
+    expect(
+      shouldExcludeProviderFromDefaultHighSignalLiveSweep({
+        provider: "codex-cli",
+        useExplicitModels: false,
+        providerFilter: null,
+      }),
+    ).toBe(true);
   });
 
-  it("keeps non-minimax opencode modern models", () => {
-    expect(isModernModelRef({ provider: "opencode", id: "claude-opus-4-6" })).toBe(true);
-    expect(isModernModelRef({ provider: "opencode", id: "gemini-3-pro" })).toBe(true);
+  it("keeps dedicated harness providers when explicitly requested by provider filter", () => {
+    expect(
+      shouldExcludeProviderFromDefaultHighSignalLiveSweep({
+        provider: "codex",
+        useExplicitModels: false,
+        providerFilter: new Set(["codex"]),
+      }),
+    ).toBe(false);
+    expect(
+      shouldExcludeProviderFromDefaultHighSignalLiveSweep({
+        provider: "openai-codex",
+        useExplicitModels: false,
+        providerFilter: new Set(["codex-cli"]),
+      }),
+    ).toBe(false);
+    expect(
+      shouldExcludeProviderFromDefaultHighSignalLiveSweep({
+        provider: "openai-codex",
+        useExplicitModels: false,
+        providerFilter: new Set(["openai"]),
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps dedicated harness providers when the caller uses explicit model selection", () => {
+    expect(
+      shouldExcludeProviderFromDefaultHighSignalLiveSweep({
+        provider: "codex",
+        useExplicitModels: true,
+        providerFilter: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not exclude ordinary providers", () => {
+    expect(
+      shouldExcludeProviderFromDefaultHighSignalLiveSweep({
+        provider: "openai",
+        useExplicitModels: false,
+        providerFilter: null,
+      }),
+    ).toBe(false);
   });
 });
